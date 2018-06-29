@@ -3,6 +3,9 @@ from pyspark import SparkContext
 import sys
 import re
 import shutil
+import bisect
+import urllib3
+import json
 
 outputDir = sys.argv[1]
 file_dir = './file'
@@ -59,6 +62,7 @@ def validating_callsign(fileRdd):
         print('validate done!')
         shutil.rmtree(outputDir)
         non_duplicate_signs.saveAsTextFile(outputDir + '/valid_signs')
+    return non_duplicate_signs
 
 def validate_sign(sign):
     global valid_sign_count, invalid_sign_count
@@ -72,12 +76,47 @@ def validate_sign(sign):
 
 # Helper functions for looking up the call signs
 def lookup_country(sign, prefixes):
-    pass
+    pos = bisect.bisect_left(prefixes, sign)
+    return prefixes[pos].split(',')[1]
 
 def load_call_sign_table():
-    f = open(file_dir + '/files/callsign_tbl_sorted', 'r')
+    f = open(file_dir + '/callsign_tbl_sorted', 'r')
     return f.readlines()
 
-if __name__ == '__main__':
-    validating_callsign(file)
+sign_prefixes = sc.broadcast(load_call_sign_table())
 
+def process_sign_count(sign_count):
+    country = lookup_country(sign_count[0], sign_prefixes.value)
+    return (country, sign_count[1])
+
+def count_country(non_duplicate_signs):
+    country_count = non_duplicate_signs.map(process_sign_count).reduceByKey(
+        lambda x, y: x + y)
+    shutil.rmtree(outputDir)
+    country_count.saveAsTextFile(outputDir + '/country_count')
+
+
+def processCallSigns(signs):
+    """Lookup call signs using a connection pool"""
+    # Create a connection pool
+    http = urllib3.PoolManager()
+    # the URL associated with each call sign record
+    urls = map(lambda x: "http://73s.com/qsos/%s.json" % x, signs)
+    # create the requests (non-blocking)
+    requests = map(lambda x: (x, http.request('GET', x)), urls)
+    # fetch the results
+    result = map(lambda x: (x[0], json.loads(x[1].data)), requests)
+    # remove any empty results and return
+    filtered = filter(lambda x: x[1] is not None, result)
+    return filtered
+
+def fetchCallSigns(fileRdd):
+    """Fetch call signs"""
+    valid_signs = fileRdd.flatMap(extractCallSigns).filter(validate_sign)
+    sign_jsons = valid_signs.mapPartitions(lambda callSigns: processCallSigns(
+        callSigns))
+    shutil.rmtree(outputDir)
+    sign_jsons.saveAsTextFile(outputDir + '/sign_jsons')
+
+if __name__ == '__main__':
+    fetchCallSigns(file)
